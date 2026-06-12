@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { supabase } from '../supabaseClient';
-import { Search, ShoppingCart, Trash2, Package, CheckCircle, Loader2, Plus, Minus, Tag, Send } from 'lucide-react';
+import { Search, ShoppingCart, Trash2, Package, CheckCircle, Loader2, Plus, Minus, Tag, Send, Clock } from 'lucide-react';
 import Calculator from './Calculator';
 import confetti from 'canvas-confetti';
 
@@ -50,6 +50,9 @@ export default function POS({ session, selectedDepotId }) {
   const [previewInvoice, setPreviewInvoice] = useState(null);
   const [previewDeliveryNote, setPreviewDeliveryNote] = useState(null); // NEW
   const [printFormat, setPrintFormat] = useState('auto'); // 'auto', 'A4', or 'ticket'
+  const [draftInvoices, setDraftInvoices] = useState([]);
+  const [isDraftsModalOpen, setIsDraftsModalOpen] = useState(false);
+  const [draftSearchTerm, setDraftSearchTerm] = useState('');
 
   // Helper to get effective format
   const getEffectiveFormat = () => {
@@ -175,7 +178,12 @@ export default function POS({ session, selectedDepotId }) {
         let currentInvoice = activeInvoice;
         if (!currentInvoice || currentInvoice.number === 'TEMP') {
             const { data, error } = await supabase.from('factures')
-                .insert([{ number: `FAC-${Date.now().toString().slice(-6)}`, user_id: session?.user?.id, created_at: new Date().toISOString() }])
+                .insert([{ 
+                  number: `FAC-${Date.now().toString().slice(-6)}`, 
+                  user_id: session?.user?.id, 
+                  created_at: new Date().toISOString(),
+                  status: 'draft'
+                }])
                 .select()
                 .single();
             if (error) return alert("Erreur de création de facture.");
@@ -210,24 +218,96 @@ export default function POS({ session, selectedDepotId }) {
     }
   };
 
+  const parkCurrentInvoice = async () => {
+    if (!activeInvoice) return;
+    
+    // Update guest info in DB before parking if names are provided
+    if (clientName || clientPhone) {
+        await supabase.from('factures').update({
+            guest_name: clientName,
+            guest_contact: clientPhone
+        }).eq('id', activeInvoice.id);
+    }
+
+    setActiveInvoice(null);
+    setInvoiceItems([]);
+    setClientName('');
+    setClientPhone('');
+    setAdvanceAmount(0);
+    setGlobalDiscount({ value: 0, type: '%' });
+    setPaymentMode('cash');
+    setIsCalculatorOpen(false);
+    fetchDraftInvoices(); // Update badge
+  };
+
+  const fetchDraftInvoices = async () => {
+    const { data, error } = await supabase
+      .from('factures')
+      .select('*, facture_items(*)')
+      .eq('status', 'draft')
+      .order('created_at', { ascending: false });
+    
+    if (error) console.error("Error fetching drafts:", error);
+    if (data) setDraftInvoices(data.filter(inv => inv.facture_items.length > 0));
+  };
+
+  const resumeInvoice = async (invoice) => {
+    setIsProcessing(true);
+    try {
+        const { data: items, error } = await supabase
+            .from('facture_items')
+            .select('*, produits(*)')
+            .eq('facture_id', invoice.id);
+        
+        if (error) throw error;
+
+        const formattedItems = items.map(item => ({
+            ...item.produits,
+            item_id: item.id,
+            quantity: item.quantity,
+            unit_price: item.unit_price,
+            discount: item.discount_value ? (typeof item.discount_value === 'string' ? JSON.parse(item.discount_value) : item.discount_value) : null,
+            total: item.total
+        }));
+
+        setActiveInvoice(invoice);
+        setInvoiceItems(formattedItems);
+        setClientName(invoice.guest_name || '');
+        setClientPhone(invoice.guest_contact || '');
+        setIsDraftsModalOpen(false);
+    } catch (e) {
+        alert("Erreur lors de la reprise: " + e.message);
+    } finally {
+        setIsProcessing(false);
+    }
+  };
+
+  const deleteDraftInvoice = async (invoiceId) => {
+    if (!window.confirm("Supprimer cette facture en attente ?")) return;
+    await supabase.from('factures').delete().eq('id', invoiceId);
+    fetchDraftInvoices();
+  };
+
   function calculateItemTotal(item) {
     const q = Number(item.quantity) || 0;
     const qpu = Number(item.quantite_par_unite) || 1;
     const priceSup = Number(item.price_superior) || 0;
     const priceBase = Number(item.unit_price) || 0;
 
-    let baseTotal = 0;
-    if (qpu > 1 && priceSup > 0) {
-        const superior = Math.floor(q / qpu);
-        const base = q % qpu;
-        baseTotal = (superior * priceSup) + (base * priceBase);
-    } else {
-        baseTotal = q * priceBase;
-    }
+    const superior = Math.floor(q / qpu);
+    const base = q % qpu;
 
-    if (!item.discount) return baseTotal;
-    const disc = parseFloat(item.discount.value) || 0;
-    return item.discount.type === '%' ? baseTotal - (baseTotal * (disc / 100)) : baseTotal - disc;
+    const baseTotalBrut = (superior * priceSup) + (base * priceBase);
+    
+    // Safety check: ensure discount object exists and has valid numbers
+    if (!item.discount || (typeof item.discount !== 'object')) return baseTotalBrut;
+
+    const baseDisc = parseFloat(item.discount.baseDiscount) || 0;
+    const supDisc = parseFloat(item.discount.superiorDiscount) || 0;
+    
+    const totalDiscount = (superior * (isNaN(supDisc) ? 0 : supDisc)) + (base * (isNaN(baseDisc) ? 0 : baseDisc));
+    
+    return baseTotalBrut - totalDiscount;
   }
 
   const updateInvoiceGuestInfo = (field, value) => setActiveInvoice(prev => ({ ...prev, [field]: value }));
@@ -237,14 +317,24 @@ export default function POS({ session, selectedDepotId }) {
   };
 
   const applyDiscount = async (itemId, type, value) => {
-    const numericValue = parseFloat(value);
-    if (isNaN(numericValue)) return alert("Valeur invalide.");
     if (itemId === 'global') {
+        const numericValue = parseFloat(value);
+        if (isNaN(numericValue)) return alert("Valeur invalide.");
         setGlobalDiscount({ value: numericValue, type: type });
         setDiscountModal(null);
     } else {
-        setInvoiceItems(prev => prev.map(item => item.item_id === itemId ? { ...item, discount: { value: numericValue, type: type } } : item));
-        await supabase.from('facture_items').update({ discount_value: numericValue, discount_type: type }).eq('id', itemId);
+        const baseDiscount = parseFloat(value.baseDiscount) || 0;
+        const superiorDiscount = parseFloat(value.superiorDiscount) || 0;
+        
+        setInvoiceItems(prev => prev.map(item => item.item_id === itemId ? { 
+            ...item, 
+            discount: { baseDiscount, superiorDiscount } 
+        } : item));
+        
+        await supabase.from('facture_items').update({ 
+            discount_value: JSON.stringify({ baseDiscount, superiorDiscount }),
+            discount_type: 'custom' // Use a special type to indicate structured discount
+        }).eq('id', itemId);
         setDiscountModal(null);
     }
   };
@@ -558,6 +648,7 @@ export default function POS({ session, selectedDepotId }) {
     if (selectedDepotId) {
       fetchDepot();
       fetchData();
+      fetchDraftInvoices();
     }
   }, [selectedDepotId]);
 
@@ -566,16 +657,52 @@ export default function POS({ session, selectedDepotId }) {
     setFilteredProducts(term ? products.filter(p => p.name.toLowerCase().includes(term)) : products);
   }, [searchTerm, products]);
 
-  const subtotal = useMemo(() => invoiceItems.reduce((acc, item) => acc + (item.total || (item.quantity * item.unit_price)), 0), [invoiceItems]);
-  const lineDiscountsTotal = useMemo(() => invoiceItems.reduce((acc, item) => item.discount ? acc + (item.discount.type === '%' ? (item.quantity * item.unit_price) * (item.discount.value / 100) : item.discount.value) : acc, 0), [invoiceItems]);
-  const globalDiscountAmount = useMemo(() => globalDiscount.value > 0 ? (globalDiscount.type === '%' ? (subtotal - lineDiscountsTotal) * (globalDiscount.value / 100) : globalDiscount.value) : 0, [subtotal, lineDiscountsTotal, globalDiscount]);
+  const subtotal = useMemo(() => invoiceItems.reduce((acc, item) => {
+      const itemTotal = Number(item.total) || Number(calculateItemTotal(item)) || 0;
+      return acc + itemTotal;
+  }, 0), [invoiceItems]);
+
+  const lineDiscountsTotal = useMemo(() => invoiceItems.reduce((acc, item) => {
+      if (!item.discount) return acc;
+      const baseDisc = Number(item.discount.baseDiscount) || 0;
+      const supDisc = Number(item.discount.superiorDiscount) || 0;
+      const q = Number(item.quantity) || 0;
+      const qpu = Number(item.quantite_par_unite) || 1;
+      const superior = Math.floor(q / qpu);
+      const base = q % qpu;
+      return acc + (superior * supDisc) + (base * baseDisc);
+  }, 0), [invoiceItems]);
+
+  const globalDiscountAmount = useMemo(() => {
+      const val = Number(globalDiscount.value) || 0;
+      if (val === 0) return 0;
+      return globalDiscount.type === '%' ? (subtotal - lineDiscountsTotal) * (val / 100) : val;
+  }, [subtotal, lineDiscountsTotal, globalDiscount]);
+  
   const netTotal = useMemo(() => Math.max(0, subtotal - lineDiscountsTotal - globalDiscountAmount), [subtotal, lineDiscountsTotal, globalDiscountAmount]);
   const totalPages = Math.ceil(filteredProducts.length / itemsPerPage);
   const paginatedProducts = useMemo(() => filteredProducts.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage), [filteredProducts, currentPage]);
 
   const openDiscountModalForItem = (item) => {
-    if (!item || item.isGlobal) setDiscountModal({ itemId: 'global', name: 'Globale', isGlobal: true, value: globalDiscount.value, type: 'Ar' });
-    else setDiscountModal({ itemId: item.item_id, name: item.name, isGlobal: false, value: item.discount?.value || 0, type: item.discount?.type || 'Ar' });
+    if (!item || item.isGlobal) {
+        setDiscountModal({ 
+            itemId: 'global', 
+            name: 'Globale', 
+            isGlobal: true, 
+            value: globalDiscount.value, 
+            type: 'Ar' 
+        });
+    } else {
+        setDiscountModal({ 
+            itemId: item.item_id, 
+            name: item.name, 
+            isGlobal: false, 
+            baseDiscount: item.discount?.baseDiscount || 0,
+            superiorDiscount: item.discount?.superiorDiscount || 0,
+            uniteBase: item.unite_base || 'Pce',
+            uniteSuperieure: item.unite_superieure || 'Ctn'
+        });
+    }
   };
 
   const totalDiscount = useMemo(() => {
@@ -591,7 +718,20 @@ export default function POS({ session, selectedDepotId }) {
   return (
     <div className="flex flex-col gap-2 h-full p-2 pb-16">
       <div className="bg-white rounded-xl p-2 shadow-sm border border-emerald-100 flex items-center justify-between">
-        <div className="text-base font-black">Facture: {activeInvoice?.number || '...'}</div>
+        <div className="text-base font-black flex items-center gap-4">
+            <span>Facture: {activeInvoice?.number || '...'}</span>
+            <button 
+                onClick={() => { fetchDraftInvoices(); setIsDraftsModalOpen(true); }}
+                className="bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-3 py-1 rounded-lg font-black text-[12px] uppercase transition-all flex items-center gap-2 relative"
+            >
+                <Clock size={14} /> En attente
+                {draftInvoices.length > 0 && (
+                    <span className="absolute -top-2 -right-2 bg-red-500 text-white text-[10px] w-5 h-5 flex items-center justify-center rounded-full border-2 border-white animate-bounce">
+                        {draftInvoices.length}
+                    </span>
+                )}
+            </button>
+        </div>
         <div className="flex items-center gap-3">
             <button 
                 onClick={() => openDiscountModalForItem(null)}
@@ -609,44 +749,73 @@ export default function POS({ session, selectedDepotId }) {
           <div className="col-span-12 lg:col-span-8 bg-white rounded-xl shadow-sm border border-emerald-100 flex flex-col min-h-0 overflow-hidden">
             <div className="p-2 border-b border-emerald-50 bg-emerald-50/30 flex items-center justify-between">
               <h3 className="font-black text-gray-700 uppercase text-[15px] flex items-center gap-2"><ShoppingCart size={12} className="text-emerald-500" /> Panier</h3>
-              <span className="bg-emerald-500 text-white px-1.5 py-0.5 rounded-full text-[14px] font-black">{invoiceItems.length}</span>
+              <div className="flex items-center gap-2">
+                  <button 
+                      onClick={parkCurrentInvoice}
+                      disabled={!activeInvoice}
+                      className="bg-orange-100 hover:bg-orange-200 text-orange-700 px-2 py-1 rounded-lg font-black text-[11px] uppercase transition-all disabled:opacity-50"
+                  >
+                      Mettre en attente
+                  </button>
+                  <span className="bg-emerald-500 text-white px-1.5 py-0.5 rounded-full text-[14px] font-black">{invoiceItems.length}</span>
+              </div>
             </div>
             {/* Cart Header */}
-            <div className="grid grid-cols-12 gap-1 px-2 py-1 bg-emerald-50 text-[14px] font-black text-emerald-800 uppercase border-b border-emerald-100">
+            <div className="grid grid-cols-12 gap-1 px-2 py-1 bg-emerald-50 text-[12px] font-black text-emerald-800 uppercase border-b border-emerald-100">
               <div className="col-span-3">Produit</div>
               <div className="col-span-2 text-center">Qté</div>
+              <div className="col-span-2 text-center">PU (MGA)</div>
               <div className="col-span-2 text-center">Remise</div>
-              <div className="col-span-3 text-right">Total</div>
-              <div className="col-span-2 text-center">Action</div>
+              <div className="col-span-2 text-right">Total</div>
+              <div className="col-span-1 text-center"></div>
             </div>
             {/* Cart Items */}
             <div className="flex-1 overflow-y-auto p-1.5 space-y-1">
               {invoiceItems.map(item => (
                 <div key={item.item_id} onClick={() => { setActiveItemId(item.item_id); setIsCalculatorOpen(true); }} className="grid grid-cols-12 gap-1 items-center px-2 py-2 border-b border-gray-50 hover:bg-emerald-50 cursor-pointer">
                   <div className="col-span-3 flex flex-col min-w-0">
-                    <div className="font-black text-[14px] uppercase truncate">{item.name}</div>
-                    <div className="flex flex-col gap-0.5 mt-0.5">
-                      <div className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-1 rounded w-fit">
-                        {item.unit_price?.toLocaleString()} Ar / <span className="opacity-70">{item.unite_base || 'Pce'}</span>
-                      </div>
-                      {item.quantite_par_unite > 1 && item.price_superior && (
-                        <div className="text-[10px] font-bold text-orange-600 bg-orange-50 px-1 rounded w-fit">
-                          {item.price_superior.toLocaleString()} Ar / <span className="opacity-70">{item.unite_superieure || 'Unité'}</span>
-                        </div>
-                      )}
-                    </div>
+                    <div className="font-black text-[13px] uppercase truncate">{item.name}</div>
                   </div>
-                  <div className="col-span-2 text-center font-black text-[16px] bg-emerald-100 rounded">
+                  <div className="col-span-2 text-center font-black text-[14px] bg-emerald-100 rounded">
                     {formatQuantity(item.quantity, item)}
                   </div>
+                  <div className="col-span-2 text-center text-[10px] font-black text-gray-600 leading-[1.1]">
+                    {(() => {
+                        const q = Number(item.quantity) || 0;
+                        const qpu = Number(item.quantite_par_unite) || 1;
+                        const superior = Math.floor(q / qpu);
+                        const base = q % qpu;
+                        const priceSup = Number(item.price_superior) || 0;
+                        const priceBase = Number(item.unit_price) || 0;
+
+                        return (
+                            <div className="flex flex-col">
+                                {superior > 0 && <div>{superior} *  {priceSup.toLocaleString()}</div>}
+                                {base > 0 && <div>{base} * {priceBase.toLocaleString()}</div>}
+                                {superior === 0 && base === 0 && <div>{priceBase.toLocaleString()}</div>}
+                            </div>
+                        );
+                    })()}
+                  </div>
                   <div className="col-span-2 text-center">
-                    <button onClick={(e) => { e.stopPropagation(); openDiscountModalForItem(item); }} className="px-2 py-1 text-base font-black text-orange-600 bg-orange-50 border border-orange-200 rounded-lg hover:bg-orange-100 transition-colors">
-                      {item.discount ? `${item.discount.value}` : '+ Remise'}
+                    <button onClick={(e) => { e.stopPropagation(); openDiscountModalForItem(item); }} className="px-2 py-1 text-[13px] font-black text-orange-600 bg-orange-50 border border-orange-200 rounded-lg hover:bg-orange-100 transition-colors">
+                      {(() => {
+                          if (!item.discount) return '+ Remise';
+                          const q = Number(item.quantity) || 0;
+                          const qpu = Number(item.quantite_par_unite) || 1;
+                          const superior = Math.floor(q / qpu);
+                          const base = q % qpu;
+                          const baseDisc = parseFloat(item.discount.baseDiscount || 0) || 0;
+                          const supDisc = parseFloat(item.discount.superiorDiscount || 0) || 0;
+                          const totalDisc = (superior * supDisc) + (base * baseDisc);
+                          
+                          return totalDisc > 0 ? `${totalDisc.toLocaleString()} Ar` : '+ Remise';
+                      })()}
                     </button>
                   </div>
-                  <div className="col-span-3 text-right font-black text-[15px]">{(item.total || calculateItemTotal(item)).toLocaleString()} Ar</div>
-                  <div className="col-span-2 text-center">
-                    <button onClick={(e) => { e.stopPropagation(); removeItem(item.item_id, item.item_id); }} className="p-1.5 text-red-500 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 hover:text-red-700 transition-colors">
+                  <div className="col-span-2 text-right font-black text-[14px]">{(item.total || calculateItemTotal(item)).toLocaleString()}</div>
+                  <div className="col-span-1 text-center">
+                    <button onClick={(e) => { e.stopPropagation(); removeItem(item.item_id, item.item_id); }} className="p-1.5 text-red-500 hover:text-red-700 transition-colors">
                       <Trash2 size={14} />
                     </button>
                   </div>
@@ -786,18 +955,31 @@ export default function POS({ session, selectedDepotId }) {
       {discountModal && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-emerald-950/40 backdrop-blur-sm p-4">
           <div className="bg-white rounded-[2rem] shadow-2xl p-8 w-full max-w-sm">
-            <h3 className="text-2xl font-black text-gray-800 mb-2 uppercase">{discountModal.isGlobal ? 'Remise Globale' : `Remise sur ${discountModal.name}`}</h3>
-            <div className="space-y-4">
-              <div className="flex bg-gray-100 p-1 rounded-xl">
-                <button onClick={() => setDiscountModal({...discountModal, type: 'Ar'})} className={`flex-1 py-2 rounded-lg text-base font-black transition-all ${discountModal.type === 'Ar' ? 'bg-white text-emerald-600 shadow-sm' : 'text-gray-400'}`}>Ar</button>
-              {/* <button class="flex-1 py-2 rounded-lg text-base font-black transition-all bg-white text-emerald-600 shadow-sm">%</button>  <button onClick={() => setDiscountModal({...discountModal, type: '%'})} className={`flex-1 py-2 rounded-lg text-base font-black transition-all ${discountModal.type === '%' ? 'bg-white text-emerald-600 shadow-sm' : 'text-gray-400'}`}>%</button> */}
-              </div>
-              <input autoFocus type="number" className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-xl py-4 px-6 text-3xl font-black outline-none" value={discountModal.value || ''} onChange={(e) => setDiscountModal({...discountModal, value: e.target.value})} />
-              <div className="grid grid-cols-2 gap-3">
-                <button onClick={() => setDiscountModal(null)} className="py-3 text-base font-bold text-gray-400 uppercase">Annuler</button>
-                <button onClick={() => applyDiscount(discountModal.isGlobal ? 'global' : discountModal.itemId, discountModal.type, discountModal.value)} className="bg-emerald-600 text-white py-3 rounded-xl text-base font-black shadow-lg">Appliquer</button>
-              </div>
-            </div>
+            <h3 className="text-2xl font-black text-gray-800 mb-6 uppercase">{discountModal.isGlobal ? 'Remise Globale' : `Remise sur ${discountModal.name}`}</h3>
+            {discountModal.isGlobal ? (
+                <div className="space-y-4">
+                    <input autoFocus type="number" className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-xl py-4 px-6 text-3xl font-black outline-none" value={discountModal.value || ''} onChange={(e) => setDiscountModal({...discountModal, value: e.target.value})} />
+                    <div className="grid grid-cols-2 gap-3">
+                        <button onClick={() => setDiscountModal(null)} className="py-3 text-base font-bold text-gray-400 uppercase">Annuler</button>
+                        <button onClick={() => applyDiscount('global', 'Ar', discountModal.value)} className="bg-emerald-600 text-white py-3 rounded-xl text-base font-black shadow-lg">Appliquer</button>
+                    </div>
+                </div>
+            ) : (
+                <div className="space-y-4">
+                    <div>
+                        <label className="text-sm font-bold text-gray-500 uppercase">Remise par {discountModal.uniteBase}</label>
+                        <input type="number" className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-xl py-3 px-4 text-xl font-black outline-none" value={discountModal.baseDiscount || ''} onChange={(e) => setDiscountModal({...discountModal, baseDiscount: e.target.value})} />
+                    </div>
+                    <div>
+                        <label className="text-sm font-bold text-gray-500 uppercase">Remise par {discountModal.uniteSuperieure}</label>
+                        <input type="number" className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-xl py-3 px-4 text-xl font-black outline-none" value={discountModal.superiorDiscount || ''} onChange={(e) => setDiscountModal({...discountModal, superiorDiscount: e.target.value})} />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 mt-4">
+                        <button onClick={() => setDiscountModal(null)} className="py-3 text-base font-bold text-gray-400 uppercase">Annuler</button>
+                        <button onClick={() => applyDiscount(discountModal.itemId, 'Ar', { baseDiscount: discountModal.baseDiscount, superiorDiscount: discountModal.superiorDiscount })} className="bg-emerald-600 text-white py-3 rounded-xl text-base font-black shadow-lg">Appliquer</button>
+                    </div>
+                </div>
+            )}
           </div>
         </div>
       )}
@@ -891,7 +1073,7 @@ export default function POS({ session, selectedDepotId }) {
               <div id="printable-invoice" className="space-y-6">
                   <div className="flex justify-between items-start bg-emerald-600 p-8 rounded-t-2xl text-white">
                       <div>
-                          <h1 className="text-3xl font-black uppercase text-white">{currentDepotInfo?.name || 'Ambanja1 Magasin'}</h1>
+                          <h1 className="text-3xl font-black uppercase text-white">{currentDepotInfo?.name || 'Tranombarotra Hugo'}</h1>
                           <p className="text-sm font-bold opacity-90">{currentDepotInfo?.address || 'Antananarivo'}</p>
                           <p className="text-sm opacity-90">Tél: {currentDepotInfo?.phone || '---'}</p>
                       </div>
@@ -1001,7 +1183,7 @@ export default function POS({ session, selectedDepotId }) {
                 {previewInvoice && (
                   <div id="printable-invoice">
                       <div className="text-center mb-4 border-b border-dashed border-black pb-2">
-                          <h1 className="text-xl font-black uppercase text-emerald-600">{'Ambanja1 Magasin' || 'Ambanja1 Magasin'}</h1>
+                          <h1 className="text-xl font-black uppercase text-emerald-600">{'Tranombarotra Hugo' || 'Tranombarotra Hugo'}</h1>
                           <p>{currentDepotInfo?.address || 'Antananarivo'}</p>
                           <p>Tél: {currentDepotInfo?.phone || '---'}</p>
                       </div>
@@ -1084,7 +1266,10 @@ export default function POS({ session, selectedDepotId }) {
                               <p className="font-bold text-red-600">Remise Partielle: -{lineDiscountsTotal.toLocaleString()} MGA</p>
                           )}
                           {globalDiscountAmount > 0 && (
-                              <p className="font-bold text-red-600">Remise Totaux: -{globalDiscountAmount.toLocaleString()} MGA</p>
+                              <p className="font-bold text-red-600">Remise Globale: -{globalDiscountAmount.toLocaleString()} MGA</p>
+                          )}
+                          {(lineDiscountsTotal + globalDiscountAmount) > 0 && (
+                              <p className="font-bold text-red-600 border-t border-dashed border-red-200 pt-1 mt-1">Remise Totale: -{(lineDiscountsTotal + globalDiscountAmount).toLocaleString()} MGA</p>
                           )}
                           <p className="font-black text-lg mt-2 ">Net à payer: {parseFloat(previewInvoice.total_amount).toLocaleString()} MGA</p>
                       </div>
@@ -1106,7 +1291,7 @@ export default function POS({ session, selectedDepotId }) {
                   <div id="printable-dn" className="border-t-2 border-solid border-black pt-8">
                       <div className="text-center mb-4 border-b border-dashed border-black pb-2">
                           <h1 className="text-xl font-black uppercase">BON DE SORTIE</h1>
-                          <p className="font-black">Ambanja1 Magasin</p>
+                          <p className="font-black">Tranombarotra Hugo</p>
                           <p>Tél: 0387060782</p>
                           <p>Facture Réf: <span className="font-bold">{activeInvoice.number}</span></p>
                           <p>N°: <span className="font-bold">{previewDeliveryNote.bl_number}</span></p>
@@ -1138,10 +1323,13 @@ export default function POS({ session, selectedDepotId }) {
                       <div className="border-t border-dashed border-black pt-2 text-right">
                           <p className="font-bold">Total Brut: {subtotal.toLocaleString()} MGA</p>
                           {lineDiscountsTotal > 0 && (
-                              <p className="font-bold text-red-600">Remise Partiel: -{lineDiscountsTotal.toLocaleString()} MGA</p>
+                              <p className="font-bold text-red-600">Remise Partielle: -{lineDiscountsTotal.toLocaleString()} MGA</p>
                           )}
                           {globalDiscountAmount > 0 && (
-                              <p className="font-bold text-red-600">REMISE TOTAUX: -{globalDiscountAmount.toLocaleString()} MGA</p>
+                              <p className="font-bold text-red-600">Remise Globale: -{globalDiscountAmount.toLocaleString()} MGA</p>
+                          )}
+                          {(lineDiscountsTotal + globalDiscountAmount) > 0 && (
+                              <p className="font-bold text-red-600 border-t border-dashed border-red-200 pt-1 mt-1">Remise Totale: -{(lineDiscountsTotal + globalDiscountAmount).toLocaleString()} MGA</p>
                           )}
                           <p className="font-black text-lg mt-2">NET À PAYER: {parseFloat(previewDeliveryNote.total_amount).toLocaleString()} MGA</p>
                       </div>
@@ -1189,6 +1377,74 @@ export default function POS({ session, selectedDepotId }) {
                     </div>
                 </div>
             )}
+      {isDraftsModalOpen && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center bg-emerald-950/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-3xl shadow-2xl p-6 w-full max-w-2xl max-h-[80vh] flex flex-col">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-2xl font-black text-gray-800 uppercase flex items-center gap-2">
+                <Clock className="text-emerald-600" /> Factures en attente
+              </h3>
+              <button onClick={() => { setIsDraftsModalOpen(false); setDraftSearchTerm(''); }} className="text-gray-400 hover:text-gray-600 font-bold text-xl">✕</button>
+            </div>
+
+            <div className="mb-6 relative">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-emerald-400" size={18} />
+              <input 
+                type="text" 
+                placeholder="Chercher par nom, téléphone ou N°..." 
+                className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-2xl py-3 pl-12 pr-4 text-base font-bold outline-none focus:border-emerald-500 transition-all"
+                value={draftSearchTerm}
+                onChange={(e) => setDraftSearchTerm(e.target.value)}
+                autoFocus
+              />
+            </div>
+            
+            <div className="flex-1 overflow-y-auto space-y-3 pr-2">
+              {draftInvoices.filter(inv => {
+                const term = draftSearchTerm.toLowerCase();
+                return inv.number.toLowerCase().includes(term) || 
+                       (inv.guest_name || '').toLowerCase().includes(term) || 
+                       (inv.guest_contact || '').toLowerCase().includes(term);
+              }).length === 0 ? (
+                <div className="text-center py-12 text-gray-400 font-bold uppercase tracking-widest">
+                  {draftSearchTerm ? 'Aucun résultat trouvé' : 'Aucune facture en attente'}
+                </div>
+              ) : (
+                draftInvoices.filter(inv => {
+                    const term = draftSearchTerm.toLowerCase();
+                    return inv.number.toLowerCase().includes(term) || 
+                           (inv.guest_name || '').toLowerCase().includes(term) || 
+                           (inv.guest_contact || '').toLowerCase().includes(term);
+                }).map(inv => (
+                  <div key={inv.id} className="bg-emerald-50/50 border border-emerald-100 rounded-2xl p-4 flex items-center justify-between hover:bg-emerald-50 transition-colors cursor-pointer" onClick={() => resumeInvoice(inv)}>
+                    <div className="flex flex-col">
+                      <div className="font-black text-emerald-800 uppercase">{inv.number}</div>
+                      <div className="text-[12px] font-bold text-emerald-600/70">
+                        {new Date(inv.created_at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                      <div className="mt-1 text-gray-700 font-black uppercase text-[13px]">
+                        {inv.guest_name || 'Client Anonyme'} {inv.guest_contact ? `(${inv.guest_contact})` : ''}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <div className="text-right">
+                        <div className="text-[11px] font-black text-gray-400 uppercase">Articles</div>
+                        <div className="text-lg font-black text-emerald-700">{inv.facture_items.length}</div>
+                      </div>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); deleteDraftInvoice(inv.id); }}
+                        className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
+                      >
+                        <Trash2 size={20} />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
