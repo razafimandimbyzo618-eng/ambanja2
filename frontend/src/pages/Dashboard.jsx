@@ -82,56 +82,64 @@ export default function Dashboard({ session }) {
   const [pendingNavigation, setPendingNavigation] = useState(null);
 
   const [userRole, setUserRole] = useState(null);
-useEffect(() => {
-  const fetchUserRole = async () => {
-      if (!session?.user?.id) return;
-      const { data } = await supabase
-          .from('user_roles')
-          .select('role')
-          .eq('user_id', session.user.id)
-          .maybeSingle();
-      if (data && data.role) {
-          setUserRole(data.role);
-          if (data.role === 'caissier') {
-              logCashierEntry(session.user.id);
-          }
-      } else {
-          setUserRole('user'); // Default
+  useEffect(() => {
+    const fetchUserRole = async () => {
+        if (!session?.user?.id) return;
+        const { data } = await supabase
+            .from('user_roles')
+            .select('role')
+            .eq('user_id', session.user.id)
+            .maybeSingle();
+        
+        if (data && data.role) {
+            setUserRole(data.role);
+            // STRICT : Seul le rôle 'caissier' est enregistré
+            if (data.role.toLowerCase() === 'caissier') {
+                logCashierEntry(session.user.id);
+            }
+        } else {
+            setUserRole('user'); // Default
+        }
+    };
+    fetchUserRole();
+
+    const fetchAdminCode = async () => {
+        const { data } = await supabase
+            .from('admin_settings')
+            .select('value')
+            .eq('key', 'admin_code')
+            .single();
+        if (data) setDbAdminCode(data.value);
+    };
+    fetchAdminCode();
+  }, [session]);
+
+  const logCashierEntry = async (userId) => {
+      const now = new Date();
+      // On utilise la date locale pour éviter les problèmes de fuseau horaire
+      const today = now.toLocaleDateString('en-CA'); // Format YYYY-MM-DD
+      
+      // On vérifie s'il existe une entrée qui a commencé AUJOURD'HUI
+      const { data: existingLogs, error } = await supabase
+          .from('cashier_logs')
+          .select('id')
+          .eq('user_id', userId)
+          .gte('login_time', `${today}T00:00:00`)
+          .lte('login_time', `${today}T23:59:59`);
+
+      if (error) {
+          console.error("Erreur vérification doublons:", error);
+          return;
+      }
+
+      // Insertion seulement si aucun log n'existe pour ce jour
+      if (!existingLogs || existingLogs.length === 0) {
+          await supabase.from('cashier_logs').insert([{ 
+              user_id: userId,
+              login_time: new Date().toISOString() 
+          }]);
       }
   };
-  fetchUserRole();
-
-  const fetchAdminCode = async () => {
-      const { data } = await supabase
-          .from('admin_settings')
-          .select('value')
-          .eq('key', 'admin_code')
-          .single();
-      if (data) setDbAdminCode(data.value);
-  };
-  fetchAdminCode();
-}, [session]);
-
-const logCashierEntry = async (userId) => {
-    const today = new Date().toISOString().split('T')[0];
-    
-    // Check if a log entry for today already exists
-    const { data: existingLogs, error } = await supabase
-        .from('cashier_logs')
-        .select('id')
-        .eq('user_id', userId)
-        .gte('login_time', `${today}T00:00:00Z`);
-
-    if (error) {
-        console.error("Error checking existing logs:", error);
-        return;
-    }
-
-    // Only insert if no logs exist for today
-    if (!existingLogs || existingLogs.length === 0) {
-        await supabase.from('cashier_logs').insert([{ user_id: userId }]);
-    }
-};
 
   const handleProtectedNavigation = (path) => {
     if (isAdminAuthenticated) {
