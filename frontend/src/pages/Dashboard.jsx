@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useNavigate, useLocation, Routes, Route, Navigate } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 import { 
@@ -82,20 +82,23 @@ export default function Dashboard({ session }) {
   const [pendingNavigation, setPendingNavigation] = useState(null);
 
   const [userRole, setUserRole] = useState(null);
+  const hasLoggedEntry = useRef(false);
+
   useEffect(() => {
     const fetchUserRole = async () => {
-        if (!session?.user?.id) return;
+        if (!session?.user?.id || hasLoggedEntry.current) return;
+        
         const { data } = await supabase
             .from('user_roles')
             .select('role')
             .eq('user_id', session.user.id)
             .maybeSingle();
-        
+
         if (data && data.role) {
             setUserRole(data.role);
-            // STRICT : Seul le rôle 'caissier' est enregistré
-            if (data.role.toLowerCase() === 'caissier') {
-                logCashierEntry(session.user.id);
+            if (data.role === 'caissier' && !hasLoggedEntry.current) {
+                hasLoggedEntry.current = true;
+                await logCashierEntry(session.user.id);
             }
         } else {
             setUserRole('user'); // Default
@@ -112,34 +115,28 @@ export default function Dashboard({ session }) {
         if (data) setDbAdminCode(data.value);
     };
     fetchAdminCode();
-  }, [session]);
+  }, [session?.user?.id]);
 
-  const logCashierEntry = async (userId) => {
-      const now = new Date();
-      // On utilise la date locale pour éviter les problèmes de fuseau horaire
-      const today = now.toLocaleDateString('en-CA'); // Format YYYY-MM-DD
-      
-      // On vérifie s'il existe une entrée qui a commencé AUJOURD'HUI
-      const { data: existingLogs, error } = await supabase
-          .from('cashier_logs')
-          .select('id')
-          .eq('user_id', userId)
-          .gte('login_time', `${today}T00:00:00`)
-          .lte('login_time', `${today}T23:59:59`);
+const logCashierEntry = async (userId) => {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Check if a log entry for today already exists
+    const { data: existingLogs, error } = await supabase
+        .from('cashier_logs')
+        .select('id')
+        .eq('user_id', userId)
+        .gte('login_time', `${today}T00:00:00Z`);
 
-      if (error) {
-          console.error("Erreur vérification doublons:", error);
-          return;
-      }
+    if (error) {
+        console.error("Error checking existing logs:", error);
+        return;
+    }
 
-      // Insertion seulement si aucun log n'existe pour ce jour
-      if (!existingLogs || existingLogs.length === 0) {
-          await supabase.from('cashier_logs').insert([{ 
-              user_id: userId,
-              login_time: new Date().toISOString() 
-          }]);
-      }
-  };
+    // Only insert if no logs exist for today
+    if (!existingLogs || existingLogs.length === 0) {
+        await supabase.from('cashier_logs').insert([{ user_id: userId }]);
+    }
+};
 
   const handleProtectedNavigation = (path) => {
     if (isAdminAuthenticated) {

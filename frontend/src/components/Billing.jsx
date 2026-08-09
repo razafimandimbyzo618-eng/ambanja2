@@ -244,9 +244,9 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
         .from('factures')
         .select('depot_id')
         .eq('id', invoice.id)
-        .single();
+        .maybeSingle();
         
-      if (invError) throw invError;
+      if (invError || !invoiceData) throw new Error(invError?.message || "Facture introuvable");
       const depotId = invoiceData.depot_id;
 
       const { data: items, error: itemsError } = await supabase
@@ -301,9 +301,9 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
         .from('factures')
         .select('depot_id')
         .eq('id', invoice.id)
-        .single();
+        .maybeSingle();
         
-      if (invError) throw invError;
+      if (invError || !invoiceData) throw new Error(invError?.message || "Facture introuvable");
       const depotId = invoiceData.depot_id;
 
       const { data: items, error: itemsError } = await supabase
@@ -434,14 +434,20 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
         totalBrut += lineBrut;
 
         // Correctly handle discount fields
-        // Checking for nested object or flat fields
-        const discValue = item.discount?.value || item.discount_value || item.discount || 0;
-        const discType = item.discount?.type || item.discount_type || '%'; 
-        
-        // Ensure discount is treated correctly based on type
-        const discountVal = (discType === '%' || discType === 'percentage') 
-            ? (lineBrut * parseFloat(discValue) / 100) 
-            : parseFloat(discValue);
+        let discountVal = 0;
+        if (item.discount_type === 'custom' && item.discount_value) {
+            const dv = typeof item.discount_value === 'string' ? JSON.parse(item.discount_value) : item.discount_value;
+            const baseD = parseFloat(dv.baseDiscount) || 0;
+            let supD = parseFloat(dv.superiorDiscount) || 0;
+            if (supD === 0 && baseD > 0) supD = baseD * qpu;
+            discountVal = (superior * supD) + (base * baseD);
+        } else {
+            const discValue = item.discount?.value || item.discount_value || item.discount || 0;
+            const discType = item.discount?.type || item.discount_type || '%'; 
+            discountVal = (discType === '%' || discType === 'percentage') 
+                ? (lineBrut * parseFloat(discValue) / 100) 
+                : parseFloat(discValue);
+        }
         
         totalRemisePartielle += discountVal;
 
@@ -458,17 +464,17 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
             puDisplay = `<div style="font-size: 8px;">P/${p.unite_base}: ${priceBase.toLocaleString('fr-MG')} ar</div>`;
         }
 
+        const netUnitPrice = (superior > 0 ? priceSup : priceBase) - (q > 0 ? (discountVal / q) : 0);
         const qDisplay = `${superior > 0 ? superior + ' ' + (p.unite_superieure || 'Ctn') : ''} ${base > 0 ? base + ' ' + (p.unite_base || 'Pce') : ''}`;
 
         return `
           <tr style="border-bottom: 1px solid #f3f4f6;">
             <td style="padding: 15px 0;">
               <p style="font-size: 14px; font-weight: 700; color: #1f2937; margin: 0;">${p.name || 'Produit Inconnu'}</p>
-              <div style="margin: 2px 0;">
-                ${puDisplay}
-              </div>
             </td>
             <td style="padding: 15px 0; text-align: center; font-size: 14px; font-weight: 700; color: #4b5563;">${qDisplay}</td>
+            <td style="padding: 15px 0; text-align: right; font-size: 14px; font-weight: 700;">${(superior > 0 ? priceSup : priceBase).toLocaleString('fr-MG')}</td>
+            <td style="padding: 15px 0; text-align: right; font-size: 14px; font-weight: 700; color: #059669;">${netUnitPrice.toLocaleString('fr-MG')}</td>
             <td style="padding: 15px 0; text-align: right; font-size: 14px; font-weight: 700; color: #ef4444;">${discountVal > 0 ? `-${discountVal.toLocaleString('fr-MG')}` : '-'}</td>
             <td style="padding: 15px 0; text-align: right; font-size: 14px; font-weight: 900; color: #111827;">${totalLineNet.toLocaleString('fr-MG')} Ar</td>
           </tr>
@@ -516,10 +522,12 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
         <table style="width: 100%; border-collapse: collapse;">
           <thead>
             <tr style="border-bottom: 2px solid #f3f4f6;">
-              <th style="padding: 15px 0; text-align: left; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Produit (PU)</th>
+              <th style="padding: 15px 0; text-align: left; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Désignation</th>
               <th style="padding: 15px 0; text-align: center; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Qté</th>
+              <th style="padding: 15px 0; text-align: right; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">PU (MGA)</th>
+              <th style="padding: 15px 0; text-align: right; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">PU Net</th>
               <th style="padding: 15px 0; text-align: right; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Remise</th>
-              <th style="padding: 15px 0; text-align: right; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Total</th>
+              <th style="padding: 15px 0; text-align: right; font-size: 11px; font-weight: 900; color: #9ca3af; text-transform: uppercase;">Montant</th>
             </tr>
           </thead>
           <tbody>
@@ -535,16 +543,16 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                 ${totalRemisePartielle > 0 ? `
                 <tr>
                   <td colspan="3" style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444; text-transform: uppercase;">Remise Partielle (Articles)</td>
-                  <td style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444;">-${totalRemisePartielle.toLocaleString('fr-MG')} MGA</td>
+                  <td style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444;">${totalRemisePartielle.toLocaleString('fr-MG')} MGA</td>
                 </tr>` : ''}
                 ${totalRemiseGlobale > 0 ? `
                 <tr>
                   <td colspan="3" style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444; text-transform: uppercase;">Remise Globale</td>
-                  <td style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444;">-${totalRemiseGlobale.toLocaleString('fr-MG')} MGA</td>
+                  <td style="padding: 2px 0; text-align: right; font-size: 12px; font-weight: 600; color: #ef4444;">${totalRemiseGlobale.toLocaleString('fr-MG')} MGA</td>
                 </tr>` : ''}
                 <tr>
                   <td colspan="3" style="padding: 5px 0 15px 0; text-align: right; font-size: 14px; font-weight: 800; color: #ef4444; text-transform: uppercase; border-top: 1px dashed #ef4444;">Remise Totale</td>
-                  <td style="padding: 5px 0 15px 0; text-align: right; font-size: 14px; font-weight: 800; color: #ef4444; border-top: 1px dashed #ef4444;">-${totalRemiseTotale.toLocaleString('fr-MG')} MGA</td>
+                  <td style="padding: 5px 0 15px 0; text-align: right; font-size: 14px; font-weight: 800; color: #ef4444; border-top: 1px dashed #ef4444;">${totalRemiseTotale.toLocaleString('fr-MG')} MGA</td>
                 </tr>
                 </>
             ) : ''}
@@ -1017,7 +1025,7 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                               <tr className="bg-emerald-600 text-white">
                                   <th className="p-3 text-left uppercase text-xs font-black">Désignation</th>
                                   <th className="p-3 text-center uppercase text-xs font-black">Quantité</th>
-                                  <th className="p-3 text-right uppercase text-xs font-black">Prix Unitaire</th>
+                                  <th className="p-3 text-right uppercase text-xs font-black">PU-Remise</th>
                                   <th className="p-3 text-right uppercase text-xs font-black">Remise</th>
                                   <th className="p-3 text-right uppercase text-xs font-black">Montant</th>
                               </tr>
@@ -1033,10 +1041,23 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                                   const priceBase = Number(item.unit_price) || 0;
                                   const lineBrutTotal = (superior * priceSup) + (base * priceBase);
                                   
-                                  const discValue = item.discount?.value || item.discount_value || 0;
-                                  const discType = item.discount?.type || item.discount_type || 'Ar';
-                                  const lineDiscount = discType === '%' ? (lineBrutTotal * parseFloat(discValue) / 100) : parseFloat(discValue);
+                                  let lineDiscount = 0;
+                                  if (item.discount_type === 'custom' && item.discount_value) {
+                                      const dv = typeof item.discount_value === 'string' ? JSON.parse(item.discount_value) : item.discount_value;
+                                      const baseD = parseFloat(dv.baseDiscount) || 0;
+                                      let supD = parseFloat(dv.superiorDiscount) || 0;
+                                      if (supD === 0 && baseD > 0) supD = baseD * qpu;
+                                      lineDiscount = (superior * supD) + (base * baseD);
+                                  } else {
+                                      const discValue = item.discount?.value || item.discount_value || 0;
+                                      const discType = item.discount?.type || item.discount_type || 'Ar';
+                                      lineDiscount = discType === '%' ? (lineBrutTotal * parseFloat(discValue) / 100) : parseFloat(discValue);
+                                  }
                                   const lineNetTotal = lineBrutTotal - lineDiscount;
+                                  
+                                  // Calcul du PU-Remise estimé
+                                  const discountPerUnit = q > 0 ? (lineDiscount / q) : 0;
+                                  const discountedUnitPrice = (superior > 0 ? priceSup : priceBase) - discountPerUnit;
 
                                   return (
                                     <tr key={item.id}>
@@ -1052,14 +1073,7 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                                                 <span>{q} {p.unite_base || 'Pce'}</span>
                                             )}
                                         </td>
-                                        <td className="p-3 text-right">
-                                            <div className="font-bold">{priceBase.toLocaleString()}</div>
-                                            {priceSup > 0 && (
-                                                <div className="text-[10px] text-gray-500 font-medium">
-                                                    {priceSup.toLocaleString()} / {p.unite_superieure || 'Ctn'}
-                                                </div>
-                                            )}
-                                        </td>
+                                        <td className="p-3 text-right font-bold text-emerald-600">{discountedUnitPrice.toLocaleString()}</td>
                                         <td className="p-3 text-right text-red-600">{lineDiscount > 0 ? `-${lineDiscount.toLocaleString()}` : '-'}</td>
                                         <td className="p-3 text-right font-black">{lineNetTotal.toLocaleString()}</td>
                                     </tr>
@@ -1170,12 +1184,12 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                                 {viewingInvoice.remises.map(r => (
                                     <div key={r.id} className="flex justify-between font-bold text-orange-700">
                                         <span>• {r.type_remise === 'global' ? 'Remise Globale' : `Remise Produit`}</span>
-                                        <span>-{parseFloat(r.montant_calcule).toLocaleString()} Ar</span>
+                                        <span>{parseFloat(r.montant_calcule).toLocaleString()} Ar</span>
                                     </div>
                                 ))}
                                 <div className="pt-1 mt-0.5 border-t border-orange-200 flex justify-between font-black text-orange-900">
                                     <span>TOTAL REMISES</span>
-                                    <span>-{viewingInvoice.remises.reduce((sum, r) => sum + (parseFloat(r.montant_calcule) || 0), 0).toLocaleString()} Ar</span>
+                                    <span>{viewingInvoice.remises.reduce((sum, r) => sum + (parseFloat(r.montant_calcule) || 0), 0).toLocaleString()} Ar</span>
                                 </div>
                             </div>
                         </div>
@@ -1197,7 +1211,16 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                                 const totalLineBrut = (superior * priceSup) + (base * priceBase);
                                 totalBrut += totalLineBrut;
                                 
-                                const discVal = i.discount ? (i.discount.type === '%' ? (totalLineBrut * parseFloat(i.discount.value) / 100) : parseFloat(i.discount.value)) : 0;
+                                let discVal = 0;
+                                if (i.discount_type === 'custom' && i.discount_value) {
+                                    const dv = typeof i.discount_value === 'string' ? JSON.parse(i.discount_value) : i.discount_value;
+                                    const baseD = parseFloat(dv.baseDiscount) || 0;
+                                    let supD = parseFloat(dv.superiorDiscount) || 0;
+                                    if (supD === 0 && baseD > 0) supD = baseD * qpu;
+                                    discVal = (superior * supD) + (base * baseD);
+                                } else {
+                                    discVal = i.discount ? (i.discount.type === '%' ? (totalLineBrut * parseFloat(i.discount.value) / 100) : parseFloat(i.discount.value)) : 0;
+                                }
                                 totalRemisePartielle += discVal;
                             });
                             
@@ -1208,7 +1231,7 @@ export default function Billing({ initialSearchTerm, onSearchReset }) {
                                 <>
                                     <p className="font-bold">Total Brut: {totalBrut.toLocaleString()} MGA</p>
                                     {totalRemisePartielle > 0 && (
-                                        <p className="font-bold text-red-600">Remise Partielle: -{totalRemisePartielle.toLocaleString()} MGA</p>
+                                        <p className="font-bold text-red-600">Remise Partielle: {totalRemisePartielle.toLocaleString()} MGA</p>
                                     )}
                                     {totalRemiseGlobale > 0 && (
                                         <p className="font-bold text-red-600"></p>

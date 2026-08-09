@@ -12,12 +12,8 @@ export default function CashierLogs() {
   const fetchLogs = async () => {
     const { data, error } = await supabase
         .from('cashier_logs')
-        .select('*, profiles!cashier_logs_user_id_fkey(full_name)')
+        .select('*, profiles:user_id(full_name)')
         .order('login_time', { ascending: false });
-    
-    if (error) {
-        console.error("Erreur lors de la récupération des logs:", error);
-    }
     if (data) setLogs(data);
   };
 
